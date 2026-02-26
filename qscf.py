@@ -4,8 +4,8 @@ import os
 import sys
 import time
 import scipy
-import numpy as np
 import pennylane as qml
+from pennylane import numpy as np
 from pyscf import gto, scf
 
 np.random.seed(42)
@@ -34,12 +34,13 @@ class VQE:
         self.bases = np.array([list(np.binary_repr(i, width=self.M)) for i in range(self.N)], dtype='int')
         self.weight = [(self.N - k) / (self.N * (self.N + 1) / 2) for k in range(self.N)]
 
-        self.max_itr = 100
+        self.maxiter = 1000
 
         self.projector = self.gen_projector()
 
         #self.dev = qml.device('default.qubit', wires=self.M)
         self.dev = qml.device('lightning.gpu', wires=self.M)
+        #self.dev = qml.device('lightning.gpu', wires=self.M, shots=1000)
         self.qnode_gamma  = qml.QNode(self.circuit_gamma,  self.dev)
         self.qnode_energy = qml.QNode(self.circuit_energy, self.dev)
 
@@ -82,7 +83,9 @@ class VQE:
 
     def get_dm(self, theta):
         gamma = np.array([self.qnode_gamma(theta, basis) for basis in self.bases[:self.Nocc]]).reshape(-1, self.N, self.N)
-        dm = 2 * np.sum([self.shm.conj().T @ g @ self.shm for g in gamma], axis=0)
+        dm = 2 * np.sum([self.shm.conj().T @ (0.5 * (g + g.conj().T)) @ self.shm for g in gamma], axis=0)
+        #ne, occ = np.trace(self.s1e @ dm).real, np.linalg.eigvalsh(self.shp @ dm @ self.shp)
+        #print(f'ne= {ne:9f} occ= {occ} => {sum(occ)}')
         return dm
 
     def cost_qdft(self, theta, fock, hamiltonian, alpha):
@@ -105,11 +108,21 @@ class VQE:
 
     def init_dm(self, theta):
         dm_target = self.mf.get_init_guess(self.mol, self.mf.init_guess, s1e=self.s1e)
+        """
         res = scipy.optimize.minimize(self.cost_dm, theta,
                                       args=(dm_target, ),
                                       method='L-BFGS-B',
                                       options={'disp': False})
-        return res.x, dm_target
+        return np.array(res.x, dtype=float), dm_target
+        """
+        norm2_log = [999] * 10
+        opt = qml.SPSAOptimizer(maxiter=self.maxiter)
+        for _ in range(self.maxiter):
+            norm2_old = norm2
+            theta, norm2 = opt.step_and_cost(self.cost_dm, theta, dm_target=dm_target)
+            print(f'{norm2:f}, {abs(norm2_old - norm2):f}')
+            if abs(abs(norm2_old - norm2)) < 1e-4: break
+        return theta, dm_target
 
     def dft(self):
         t0 = time.time()
@@ -152,9 +165,6 @@ class VQE:
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
 
         for itr in range(self.max_itr):
-            #ne, occ = np.trace(self.s1e @ dm).real, np.linalg.eigvalsh(self.shp @ dm @ self.shp)
-            #print(f'ne= {ne:9f} occ= {occ} => {sum(occ)}')
-
             dm_last = dm
             etot_last = etot
 
@@ -180,11 +190,21 @@ class VQE:
         t0 = time.time()
 
         theta, _ = self.init_dm(theta)
-        res = scipy.optimize.minimize(vqe.cost_qscf, theta,
+        print()
+        """
+        res = scipy.optimize.minimize(self.cost_qscf, theta,
                                       method='L-BFGS-B',
                                       options={'disp': True})
         theta = res.x
         etot = self.cost_qscf(theta) 
+        """
+        etot = 999
+        opt = qml.SPSAOptimizer(maxiter=self.maxiter)
+        for _ in range(self.maxiter):
+            etot_old = etot
+            theta, etot = opt.step_and_cost(self.cost_qscf, theta)
+            print(f'{etot:f}, {abs(etot - etot_old)}')
+            if abs(etot - etot_old) < 1e-6: break
 
         with open(f'{self.dir_output}/qscf.etot', 'w') as f: f.write(f'{etot:f}')
         tm, ts = divmod(int(time.time() - t0), 60)
@@ -192,8 +212,8 @@ class VQE:
 
 #for R in np.arange(0.5, 2.05, 0.05):
 vqe = VQE(N=4, R=1.0)
-theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1))
+theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1), requires_grad=True)
 #vqe.dft()
-vqe.dft_custom()
-vqe.qdft(theta)
+#vqe.dft_custom()
+#vqe.qdft(theta)
 vqe.qscf(theta)
