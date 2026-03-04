@@ -34,7 +34,8 @@ class VQE:
         self.bases = np.array([list(np.binary_repr(i, width=self.M)) for i in range(self.N)], dtype='int')
         self.weight = [(self.N - k) / (self.N * (self.N + 1) / 2) for k in range(self.N)]
 
-        self.maxiter = 1000
+        self.max_iter = 1000
+        self.n_log = 10
 
         self.projector = self.gen_projector()
 
@@ -115,13 +116,15 @@ class VQE:
                                       options={'disp': False})
         return np.array(res.x, dtype=float), dm_target
         """
-        norm2_log = [999] * 10
-        opt = qml.SPSAOptimizer(maxiter=self.maxiter)
-        for _ in range(self.maxiter):
-            norm2_old = norm2
+        #norm2_log = np.random.rand(self.n_log)
+        norm2_log = [999] * self.n_log
+        opt = qml.SPSAOptimizer(maxiter=self.max_iter)
+        for i in range(self.max_iter):
+            norm2_old = norm2_log[0]
             theta, norm2 = opt.step_and_cost(self.cost_dm, theta, dm_target=dm_target)
-            print(f'{norm2:f}, {abs(norm2_old - norm2):f}')
-            if abs(abs(norm2_old - norm2)) < 1e-4: break
+            norm2_log[i % self.n_log] = norm2
+            print(f'{norm2:f}, {abs(norm2_old - norm2):f} {np.std(norm2_log):f}')
+            #if abs(norm2_old - norm2) < 0.1 * np.std(norm2_log): break
         return theta, dm_target
 
     def dft(self):
@@ -199,8 +202,8 @@ class VQE:
         etot = self.cost_qscf(theta) 
         """
         etot = 999
-        opt = qml.SPSAOptimizer(maxiter=self.maxiter)
-        for _ in range(self.maxiter):
+        opt = qml.SPSAOptimizer(maxiter=self.max_iter)
+        for _ in range(self.max_iter):
             etot_old = etot
             theta, etot = opt.step_and_cost(self.cost_qscf, theta)
             print(f'{etot:f}, {abs(etot - etot_old)}')
