@@ -109,6 +109,7 @@ class VQE:
         res = scipy.optimize.minimize(self.cost_dm, theta,
                                       args=(dm_target, shots),
                                       method='COBYLA',
+                                      tol=1e-2,
                                       options={'disp': True})
         return np.array(res.x, dtype=float), dm_target
 
@@ -179,34 +180,32 @@ class VQE:
         theta, _ = self.init_dm(theta, shots)
 
         t0 = time.time()
-        """
         res = scipy.optimize.minimize(self.cost_qscf, theta,
                                       args=(shots,),
                                       method='L-BFGS-B',
+                                      tol=1e-6,
                                       options={'disp': True})
         theta = res.x
         etot = self.cost_qscf(theta, shots) 
-        """
 
+        """
         etot = 999
         opt = qml.RotosolveOptimizer()
         nums_frequency = {(i,): 1 for i in range(len(theta))}
 
-        print(f'\n{"etot":16s}{"etot_diff":16s}{"shots":6s}')
+        print(f'\n{"etot":16s}{"etot_diff":16s}')
         for _ in range(max_iter):
             etot_old = etot
             theta, etot = opt.step_and_cost(self.cost_qscf,
                                             theta, shots=shots,
                                             nums_frequency={'theta': nums_frequency})
             etot_diff = abs(etot - etot_old)
-            print(f'{etot:<16f}{etot_diff:<16f}{shots:<6d}')
+            print(f'{etot:<16f}{etot_diff:<16f}')
 
             if etot_diff < 1e-3: break
 
-            shots_new = max(shots_min, min(shots_max, int(sensitive / etot_diff)))
-            if shots_new > shots: shots = shots_new
-
         with open(f'{self.output_dir}/qscf.etot', 'w') as f: f.write(f'{etot:f}')
+        """
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.qscf.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
@@ -233,7 +232,7 @@ elif args.mat == 'Si':
 
 theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1))
 #theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1), requires_grad=True) # for qml.optimizer
-vqe.dft()
-vqe.dft_custom()
+#vqe.dft()
+#vqe.dft_custom()
 #vqe.qdft(theta)
 vqe.qscf(theta)
