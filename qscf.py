@@ -78,51 +78,39 @@ class VQE:
         self.prep_circuit(theta, basis)
         return qml.expval(hamiltonian)
 
-    def get_dm(self, theta):
-        gamma = np.array([self.qnode_gamma(theta, basis) for basis in self.bases[:self.Nocc]]).reshape(-1, self.N, self.N)
+    def get_dm(self, theta, shots):
+        ### TODO: GPU parallerization
+        gamma = np.array([self.qnode_gamma(theta, basis, shots=shots) for basis in self.bases[:self.Nocc]]).reshape(-1, self.N, self.N)
         dm = 2 * np.sum([self.shm.conj().T @ (0.5 * (g + g.conj().T)) @ self.shm for g in gamma], axis=0)
         #ne, occ = np.trace(self.s1e @ dm).real, np.linalg.eigvalsh(self.shp @ dm @ self.shp)
         #print(f'ne= {ne:9f} occ= {occ} => {sum(occ)}')
         return dm
 
-    def cost_qdft(self, theta, fock, hamiltonian, alpha):
-        e_ks = np.repeat([self.qnode_energy(theta, basis, hamiltonian) for basis in self.bases[:self.Nocc]], 2)
+    def cost_qdft(self, theta, fock, hamiltonian, alpha, shots):
+        e_ks = np.repeat([self.qnode_energy(theta, basis, hamiltonian, shots=shots) for basis in self.bases[:self.Nocc]], 2)
         e_ks_sum = np.sum(np.dot(e_ks, self.weight))
 
         dm = self.get_dm(theta)
         R = fock @ dm @ self.s1e - self.s1e @ dm @ fock # FDS - SDF = 0
         return e_ks_sum + alpha * np.linalg.norm(R, 'fro')**2
 
-    def cost_qscf(self, theta):
-        dm = self.get_dm(theta)
+    def cost_qscf(self, theta, shots):
+        dm = self.get_dm(theta, shots)
         vhf = self.mf.get_veff(self.mat, dm)
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
         return etot
 
-    def cost_dm(self, theta, dm_target):
-        dm = self.get_dm(theta)
+    def cost_dm(self, theta, dm_target, shots):
+        dm = self.get_dm(theta, shots)
         return np.linalg.norm(dm - dm_target)**2
 
-    def init_dm(self, theta):
+    def init_dm(self, theta, shots):
         dm_target = self.mf.get_init_guess(self.mat, self.mf.init_guess, s1e=self.s1e)
         res = scipy.optimize.minimize(self.cost_dm, theta,
-                                      args=(dm_target, ),
+                                      args=(dm_target, shots),
                                       method='COBYLA',
-                                      options={'disp': 3})
+                                      options={'disp': True})
         return np.array(res.x, dtype=float), dm_target
-        """
-        n_log = 10
-        #norm2_log = [999] * n_log
-        norm2_log = np.random.rand(n_log)
-        opt = qml.SPSAOptimizer(maxiter=100)
-        for i in range(100):
-            norm2_old = norm2_log[0]
-            theta, norm2 = opt.step_and_cost(self.cost_dm, theta, dm_target=dm_target)
-            norm2_log[i % n_log] = norm2
-            print(f'{norm2:f}, {abs(norm2_old - norm2):f} {np.std(norm2_log):f}')
-            if abs(norm2_old - norm2) < 0.1 * np.std(norm2_log): break
-        return theta, dm_target
-        """
 
     def dft(self):
         t0 = time.time()
@@ -132,22 +120,24 @@ class VQE:
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.dft.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
-    def dft_custom(self, e_tol=1e-6, mix=0.3):
+    def dft_custom(self, max_iter=1000, e_tol=1e-6, mix=0.3):
         t0 = time.time()
 
         dm = self.mf.get_init_guess(self.mat, self.mf.init_guess, s1e=self.s1e)
         vhf = self.mf.get_veff(self.mat, dm)
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
 
-        for itr in range(self.max_itr):
+        for itr in range(max_iter):
             dm_last = dm
             etot_last = etot
 
             fock = self.mf.get_fock(self.h1e, self.s1e, vhf, dm) # fock = h1e + vhf
             energy, coeff = self.mf.eig(fock, self.s1e)
             occ = self.mf.get_occ(energy, coeff)
-            dm = mix * self.mf.make_rdm1(coeff, occ) + (1 - mix) * dm_last
-            vhf = self.mf.get_veff(self.mat, dm, dm_last, vhf) # DIIS 쓰면 빨라지는 듯?
+            dm = self.mf.make_rdm1(coeff, occ)
+            #dm = mix * dm + (1 - mix) * dm_last
+            #vhf = self.mf.get_veff(self.mat, dm, dm_last, vhf) # DIIS
+            vhf = self.mf.get_veff(self.mat, dm, dm_last, vhf)
             etot = self.mf.energy_tot(dm, self.h1e, vhf)
             print(f'itr= {itr+1:3d} etot= {etot:9f} delta= {etot - etot_last:9f}')
 
@@ -157,21 +147,20 @@ class VQE:
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.dft_custom.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
-    def qdft(self, theta, e_tol=1e-6, mix=0.3, alpha=10):
-        t0 = time.time()
-
-        theta, dm = self.init_dm(theta)
+    def qdft(self, theta, max_iter=1000, e_tol=1e-6, mix=0.3, alpha=10, shots=None):
+        theta, dm = self.init_dm(theta, shots)
         vhf = self.mf.get_veff(self.mat, dm)
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
 
-        for itr in range(self.max_itr):
+        t0 = time.time()
+        for itr in range(max_iter):
             dm_last = dm
             etot_last = etot
 
             fock = self.mf.get_fock(self.h1e, self.s1e, vhf, dm)
             hamiltonian = qml.Hamiltonian(fock.ravel(), self.projector)
             res = scipy.optimize.minimize(self.cost_qdft, theta,
-                                          args=(fock, hamiltonian, alpha),
+                                          args=(fock, hamiltonian, alpha, shots),
                                           method='L-BFGS-B',
                                           options={'disp': False})
             theta = res.x
@@ -186,41 +175,40 @@ class VQE:
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.qdft.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
-    def qscf(self, theta, max_iter=1000):
-        t0 = time.time()
+    def qscf(self, theta, max_iter=1000, shots=None):
+        theta, _ = self.init_dm(theta, shots)
 
-        theta, _ = self.init_dm(theta)
+        t0 = time.time()
         """
         res = scipy.optimize.minimize(self.cost_qscf, theta,
-                                      method='COBYLA',
-                                      options={'disp': 3})
+                                      args=(shots,),
+                                      method='L-BFGS-B',
+                                      options={'disp': True})
         theta = res.x
-        etot = self.cost_qscf(theta) 
+        etot = self.cost_qscf(theta, shots) 
         """
+
         etot = 999
-        sensitive = 10
-        shots_min, shots_max = 100, 10000
-        nums_frequency = {(i,): 1 for i in range(len(theta)) }
         opt = qml.RotosolveOptimizer()
+        nums_frequency = {(i,): 1 for i in range(len(theta))}
 
         print(f'\n{"etot":16s}{"etot_diff":16s}{"shots":6s}')
         for _ in range(max_iter):
             etot_old = etot
-            theta, etot = opt.step_and_cost(self.cost_qscf, theta, nums_frequency={'theta': nums_frequency})
+            theta, etot = opt.step_and_cost(self.cost_qscf,
+                                            theta, shots=shots,
+                                            nums_frequency={'theta': nums_frequency})
             etot_diff = abs(etot - etot_old)
-            print(f'{etot:16f}{etot_diff:16f}{self.dev.shots.total_shots:6d}')
+            print(f'{etot:<16f}{etot_diff:<16f}{shots:<6d}')
 
-            if etot_diff < 1e-3:
-                self.dev.shots = shots_min
-                break
+            if etot_diff < 1e-3: break
 
-            shots = max(shots_min, min(shots_max, int(sensitive / etot_diff)))
-            if shots > self.dev.shots.total_shots: self.dev.shots = shots
+            shots_new = max(shots_min, min(shots_max, int(sensitive / etot_diff)))
+            if shots_new > shots: shots = shots_new
 
         with open(f'{self.output_dir}/qscf.etot', 'w') as f: f.write(f'{etot:f}')
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.qscf.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
-
 
 if args.mat == 'H':
     from pyscf import gto, scf # Gaussian-Type Orbital (GTO)
@@ -243,8 +231,9 @@ elif args.mat == 'Si':
     mf = scf.RKS(mat, xc='PBE')
     vqe = VQE(N, mat, mf, f'Si_a{a:.2f}')
 
-theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1), requires_grad=True)
+theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1))
+#theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1), requires_grad=True) # for qml.optimizer
 vqe.dft()
-#vqe.dft_custom()
+vqe.dft_custom()
 #vqe.qdft(theta)
 vqe.qscf(theta)
