@@ -4,27 +4,27 @@ import os
 import sys
 import time
 import scipy
+import argparse
 import pennylane as qml
 from pennylane import numpy as np
-from pyscf import gto, scf
 
 np.random.seed(42)
 
+parser = argparse.ArgumentParser()
+parser.add_argument('mat', type=str)
+args = parser.parse_args()
+
 class VQE:
-    def __init__(self, N=8, R=1.0):
+    def __init__(self, N, mat, mf, output_dir):
         self.N = N
-        self.R = R
         self.Nocc = self.N // 2
-        self.dir_output = f'output/H{self.N:d}_R{self.R:.2f}'
-        os.makedirs(self.dir_output, exist_ok=True)
+        self.mat = mat
+        self.output_dir = f'output/{output_dir}'
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        self.mol = gto.M(atom = '; '.join([f'H {self.R*i:.1f} 0 0' for i in range(self.N)]), # Gaussian-Type Orbital (GTO)
-                     basis = 'sto-3g',
-                     pseudo = 'gth-lda')
-
-        self.mf = scf.RKS(self.mol, xc='lda') # Restricted KS-DFT (RKS): the spin-orbitals are either spin-up or spin-down
-        self.s1e = self.mf.get_ovlp(self.mol)
-        self.h1e = self.mf.get_hcore(self.mol)
+        self.mf = mf
+        self.s1e = self.mf.get_ovlp(self.mat)
+        self.h1e = self.mf.get_hcore(self.mat)
         self.shp = scipy.linalg.fractional_matrix_power(self.s1e,  0.5)
         self.shm = scipy.linalg.fractional_matrix_power(self.s1e, -0.5)
 
@@ -34,14 +34,10 @@ class VQE:
         self.bases = np.array([list(np.binary_repr(i, width=self.M)) for i in range(self.N)], dtype='int')
         self.weight = [(self.N - k) / (self.N * (self.N + 1) / 2) for k in range(self.N)]
 
-        self.max_iter = 1000
-        self.n_log = 10
-
         self.projector = self.gen_projector()
 
         #self.dev = qml.device('default.qubit', wires=self.M)
         self.dev = qml.device('lightning.gpu', wires=self.M)
-        #self.dev = qml.device('lightning.gpu', wires=self.M, shots=1000)
         self.qnode_gamma  = qml.QNode(self.circuit_gamma,  self.dev)
         self.qnode_energy = qml.QNode(self.circuit_energy, self.dev)
 
@@ -99,7 +95,7 @@ class VQE:
 
     def cost_qscf(self, theta):
         dm = self.get_dm(theta)
-        vhf = self.mf.get_veff(self.mol, dm)
+        vhf = self.mf.get_veff(self.mat, dm)
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
         return etot
 
@@ -108,24 +104,25 @@ class VQE:
         return np.linalg.norm(dm - dm_target)**2
 
     def init_dm(self, theta):
-        dm_target = self.mf.get_init_guess(self.mol, self.mf.init_guess, s1e=self.s1e)
-        """
+        dm_target = self.mf.get_init_guess(self.mat, self.mf.init_guess, s1e=self.s1e)
         res = scipy.optimize.minimize(self.cost_dm, theta,
                                       args=(dm_target, ),
-                                      method='L-BFGS-B',
-                                      options={'disp': False})
+                                      method='COBYLA',
+                                      options={'disp': 3})
         return np.array(res.x, dtype=float), dm_target
         """
-        #norm2_log = np.random.rand(self.n_log)
-        norm2_log = [999] * self.n_log
-        opt = qml.SPSAOptimizer(maxiter=self.max_iter)
-        for i in range(self.max_iter):
+        n_log = 10
+        #norm2_log = [999] * n_log
+        norm2_log = np.random.rand(n_log)
+        opt = qml.SPSAOptimizer(maxiter=100)
+        for i in range(100):
             norm2_old = norm2_log[0]
             theta, norm2 = opt.step_and_cost(self.cost_dm, theta, dm_target=dm_target)
-            norm2_log[i % self.n_log] = norm2
+            norm2_log[i % n_log] = norm2
             print(f'{norm2:f}, {abs(norm2_old - norm2):f} {np.std(norm2_log):f}')
-            #if abs(norm2_old - norm2) < 0.1 * np.std(norm2_log): break
+            if abs(norm2_old - norm2) < 0.1 * np.std(norm2_log): break
         return theta, dm_target
+        """
 
     def dft(self):
         t0 = time.time()
@@ -138,8 +135,8 @@ class VQE:
     def dft_custom(self, e_tol=1e-6, mix=0.3):
         t0 = time.time()
 
-        dm = self.mf.get_init_guess(self.mol, self.mf.init_guess, s1e=self.s1e)
-        vhf = self.mf.get_veff(self.mol, dm)
+        dm = self.mf.get_init_guess(self.mat, self.mf.init_guess, s1e=self.s1e)
+        vhf = self.mf.get_veff(self.mat, dm)
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
 
         for itr in range(self.max_itr):
@@ -150,13 +147,13 @@ class VQE:
             energy, coeff = self.mf.eig(fock, self.s1e)
             occ = self.mf.get_occ(energy, coeff)
             dm = mix * self.mf.make_rdm1(coeff, occ) + (1 - mix) * dm_last
-            vhf = self.mf.get_veff(self.mol, dm, dm_last, vhf) # DIIS 쓰면 빨라지는 듯?
+            vhf = self.mf.get_veff(self.mat, dm, dm_last, vhf) # DIIS 쓰면 빨라지는 듯?
             etot = self.mf.energy_tot(dm, self.h1e, vhf)
             print(f'itr= {itr+1:3d} etot= {etot:9f} delta= {etot - etot_last:9f}')
 
             if abs(etot - etot_last) < e_tol: break
 
-        with open(f'{self.dir_output}/dft.etot', 'w') as f: f.write(f'{etot:f}')
+        with open(f'{self.output_dir}/dft.etot', 'w') as f: f.write(f'{etot:f}')
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.dft_custom.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
@@ -164,7 +161,7 @@ class VQE:
         t0 = time.time()
 
         theta, dm = self.init_dm(theta)
-        vhf = self.mf.get_veff(self.mol, dm)
+        vhf = self.mf.get_veff(self.mat, dm)
         etot = self.mf.energy_tot(dm, self.h1e, vhf)
 
         for itr in range(self.max_itr):
@@ -179,44 +176,75 @@ class VQE:
                                           options={'disp': False})
             theta = res.x
             dm = mix * self.get_dm(theta) + (1 - mix) * dm_last
-            vhf = self.mf.get_veff(self.mol, dm)
+            vhf = self.mf.get_veff(self.mat, dm)
             etot = self.mf.energy_tot(dm, self.h1e, vhf)
             print(f'itr= {itr+1:3d} etot= {etot:9f} delta= {etot - etot_last:9f}')
 
             if abs(etot - etot_last) < e_tol: break
 
-        with open(f'{self.dir_output}/qdft.etot', 'w') as f: f.write(f'{etot:f}')
+        with open(f'{self.output_dir}/qdft.etot', 'w') as f: f.write(f'{etot:f}')
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.qdft.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
-    def qscf(self, theta):
+    def qscf(self, theta, max_iter=1000):
         t0 = time.time()
 
         theta, _ = self.init_dm(theta)
-        print()
         """
         res = scipy.optimize.minimize(self.cost_qscf, theta,
-                                      method='L-BFGS-B',
-                                      options={'disp': True})
+                                      method='COBYLA',
+                                      options={'disp': 3})
         theta = res.x
         etot = self.cost_qscf(theta) 
         """
         etot = 999
-        opt = qml.SPSAOptimizer(maxiter=self.max_iter)
-        for _ in range(self.max_iter):
-            etot_old = etot
-            theta, etot = opt.step_and_cost(self.cost_qscf, theta)
-            print(f'{etot:f}, {abs(etot - etot_old)}')
-            if abs(etot - etot_old) < 1e-6: break
+        sensitive = 10
+        shots_min, shots_max = 100, 10000
+        nums_frequency = {(i,): 1 for i in range(len(theta)) }
+        opt = qml.RotosolveOptimizer()
 
-        with open(f'{self.dir_output}/qscf.etot', 'w') as f: f.write(f'{etot:f}')
+        print(f'\n{"etot":16s}{"etot_diff":16s}{"shots":6s}')
+        for _ in range(max_iter):
+            etot_old = etot
+            theta, etot = opt.step_and_cost(self.cost_qscf, theta, nums_frequency={'theta': nums_frequency})
+            etot_diff = abs(etot - etot_old)
+            print(f'{etot:16f}{etot_diff:16f}{self.dev.shots.total_shots:6d}')
+
+            if etot_diff < 1e-3:
+                self.dev.shots = shots_min
+                break
+
+            shots = max(shots_min, min(shots_max, int(sensitive / etot_diff)))
+            if shots > self.dev.shots.total_shots: self.dev.shots = shots
+
+        with open(f'{self.output_dir}/qscf.etot', 'w') as f: f.write(f'{etot:f}')
         tm, ts = divmod(int(time.time() - t0), 60)
         print(f'{self.qscf.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
 
-#for R in np.arange(0.5, 2.05, 0.05):
-vqe = VQE(N=4, R=1.0)
+
+if args.mat == 'H':
+    from pyscf import gto, scf # Gaussian-Type Orbital (GTO)
+    N = 4
+    a = 1.0
+    #for a in np.arange(0.5, 2.05, 0.05):
+    mat = gto.M(atom='; '.join([f'H {a*i:.1f} 0 0' for i in range(N)]),
+                   basis='sto-3g',
+                   pseudo='gth-lda')
+    mf = scf.RKS(mat, xc='lda') # Restricted KS-DFT (RKS): the spin-orbitals are either spin-up or spin-down
+    vqe = VQE(N, mat, mf, f'H{N:d}_a{a:.2f}')
+elif args.mat == 'Si':
+    from pyscf.pbc import gto, scf
+    N = 8
+    a = 5.459
+    mat = gto.M(atom=f'Si 0 0 0; Si {a/4} {a/4} {a/4}',
+                   a = [[0, a/2, a/2], [a/2, 0, a/2], [a/2, a/2, 0]],
+                   basis='gth-szv',
+                   pseudo='gth-pbe')
+    mf = scf.RKS(mat, xc='PBE')
+    vqe = VQE(N, mat, mf, f'Si_a{a:.2f}')
+
 theta = 2*np.pi * np.random.rand(vqe.M * (vqe.L+1), requires_grad=True)
-#vqe.dft()
+vqe.dft()
 #vqe.dft_custom()
 #vqe.qdft(theta)
 vqe.qscf(theta)
