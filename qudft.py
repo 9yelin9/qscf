@@ -242,6 +242,7 @@ class VQE:
         print(f'{self.qudft.__name__} time elapsed: {tm}m {ts}s', end='\n\n')
         with open(f'log/{self.output_tag}_qudft_L{self.L}.log', 'w') as f: f.write(f'{etot:f} {t1}')
 
+
 if args.mat == 'H':
     from pyscf import gto, scf # Gaussian-Type Orbital (GTO)
     N = 4
